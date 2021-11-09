@@ -5,13 +5,13 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const lib = b.addSharedLibrary("templatevtab", "src/templatevtab.zig", .unversioned);
+    const lib = b.addSharedLibrary("generate_series", "src/generate_series.zig", .unversioned);
     lib.force_pic = true;
     lib.addIncludeDir("include/");
     lib.setBuildMode(mode);
     lib.install();
 
-    var main_tests = b.addTest("src/templatevtab.zig");
+    var main_tests = b.addTest("src/generate_series.zig");
     main_tests.setBuildMode(mode);
 
     const test_step = b.step("test", "Run library tests");

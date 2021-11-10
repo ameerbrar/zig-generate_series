@@ -1,3 +1,3 @@
-# zig-templatevtab
+# zig-sqlite3-generate-series
 
-A template for creating a custom SQLite3 virtual table.
+Implementation of the generate_series() table-valued function for SQLite3 in zig.

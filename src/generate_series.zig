@@ -73,11 +73,12 @@ fn resize(
 const Cursor = struct {
     base: c.sqlite3_vtab_cursor, // Base class
     // Insert new fields here.
-    start: c.sqlite3_int64,
-    step: c.sqlite3_int64,
-    stop: c.sqlite3_int64,
-    value: c.sqlite3_int64,
-    rowid: c.sqlite3_int64,
+    min_value: c.sqlite3_int64,
+    step:      c.sqlite3_int64,
+    max_value: c.sqlite3_int64,
+    value:     c.sqlite3_int64,
+    rowid:     c.sqlite3_int64,
+    is_desc:   bool,
 };
 
 //
@@ -155,7 +156,7 @@ pub fn generateSeriesBestIndex(pVTab: [*c]c.sqlite3_vtab, pIdxInfo: [*c]c.sqlite
     var i: usize = 0;
     var start_seen = false;
     var unusableMask: u3 = 0;  // Mask of unusable constraints ('100', '101', '111'...)
-    var idxNum: u3 = 0;        // The query plan bitmask '000' (step, stop, start)
+    var idxNum: u5 = 0;        // The query plan bitmask '000' (step, stop, start)
     var aIdx: [3]?usize = .{null, null, null}; // start, stop, step: (index in aConstraint)
     while (i < pIdxInfo.*.nConstraint) : (i += 1) {
         const constraint = pIdxInfo.*.aConstraint[i];
@@ -181,9 +182,9 @@ pub fn generateSeriesBestIndex(pVTab: [*c]c.sqlite3_vtab, pIdxInfo: [*c]c.sqlite
     var nArg: c_int = 1; // Number of arguments that seriesFilter() expects
     for (aIdx) |optional_index| {
         if (optional_index) |index| {
+            defer nArg += 1;
             pIdxInfo.*.aConstraintUsage[index].argvIndex = nArg;
             pIdxInfo.*.aConstraintUsage[index].omit = @boolToInt(true);
-            nArg += 1;
         }
     }
     if((unusableMask & ~idxNum)!= 0) {
@@ -207,18 +208,19 @@ pub fn generateSeriesBestIndex(pVTab: [*c]c.sqlite3_vtab, pIdxInfo: [*c]c.sqlite
         // This also accounts for the case where idxNum === '111'
         pIdxInfo.*.estimatedCost = @intToFloat(f64, @as(c_int, 10));
         pIdxInfo.*.estimatedRows = 100;
-        // For now, ignore order by
-        // if (pIdxInfo.*.nOrderBy == 1) {
-        //     if (pIdxInfo.*.aOrderBy[0].desc == @boolToInt(true)) {
-        //         idxNum |= 8; // '01000'
-        //     } else {
-        //         idxNum |= 16; // '10000'
-        //     }
-        //     pIdxInfo.*.orderByConsumed = @boolToInt(true);
-        // }
+        // Handle the order by clause
+        if (pIdxInfo.*.nOrderBy == 1) {
+            if (pIdxInfo.*.aOrderBy[0].desc == @boolToInt(true)) {
+                idxNum |= 8;  // '01000'
+            } else {
+                idxNum |= 16; // '10000'
+            }
+            // Tells sqlite3 that we will handle ordering the output
+            pIdxInfo.*.orderByConsumed = @boolToInt(true);
+        }
     } else {
-        // start or stop is missing
-        // Make this case very expensive so that the query
+        // Start or stop is missing,
+        // So make this case very expensive so that the query
         // planner will work hard to avoid it.
         pIdxInfo.*.estimatedRows = 2147483647;
     }
@@ -243,27 +245,47 @@ pub fn generateSeriesFilter(
     _ = argc;
 
     var pCur = @fieldParentPtr(Cursor, "base", pCursor);
-    // idxNum is 'xxx'
-    var i: usize =  0;
+    // idxNum is b'xyabc' where x,y,a,b,c in {0, 1}
+    var i: usize =  0; // index into argv
+    var is_desc = (idxNum & 8) != 0;
     if ((idxNum & 1) != 0) { // Start is present
-        pCur.*.start = sqlite3_api.*.value_int64.?(argv[i]);
+        pCur.*.min_value = sqlite3_api.*.value_int64.?(argv[i]);
         i += 1;
     } else {
-        pCur.*.start = 0;
+        pCur.*.min_value = 0;
     }
     if ((idxNum & 2) != 0) { // stop is present
-        pCur.*.stop = sqlite3_api.*.value_int64.?(argv[i]);
+        pCur.*.max_value = sqlite3_api.*.value_int64.?(argv[i]);
         i += 1;
     } else {
-        pCur.*.stop = 0xffffffff;
+        pCur.*.max_value = 0xffffffff;
     }
     if ((idxNum & 4) != 0) { // step is present
         pCur.*.step = sqlite3_api.*.value_int64.?(argv[i]);
-        i += 1;
+        defer i += 1;
+        if (pCur.*.step == 0) { // step = 0 doesn't make sense
+            pCur.*.step = 1;
+        } else if (pCur.*.step < 0) {
+            // (i.e) select * from generate_series(1, 10, -1);
+            pCur.*.step = pCur.*.step * -1;
+            // Change the order to descending 
+            // only if the user hasn't already said they want ascending - (i.e) say idxNum is '10111'
+            // in which case this turns into - select * from generate_series(1, 10, 1);
+            if ((idxNum & 16) == 0) {
+                is_desc = true; // idxNum |= 8;
+            }
+        }
     } else {
         pCur.*.step = 1;
     }
-    pCur.*.value = pCur.*.start;
+
+    if (is_desc) { // is descending
+        pCur.*.is_desc = true;
+        pCur.*.value = pCur.*.max_value;
+    } else { // default ascending
+        pCur.*.is_desc = false;
+        pCur.*.value = pCur.*.min_value;
+    }
     pCur.*.rowid = 1;
 
     return c.SQLITE_OK;
@@ -294,9 +316,9 @@ pub fn generateSeriesClose(pCursor: [*c]c.sqlite3_vtab_cursor) callconv(.C) c_in
 pub fn generateSeriesColumn(pCursor: [*c]c.sqlite3_vtab_cursor, cxt: ?*c.sqlite3_context, n: c_int) callconv(.C) c_int {
     const pCur = @fieldParentPtr(Cursor, "base", pCursor);
     const x = switch (n) {
-        series_start => pCur.start,
+        series_start => pCur.min_value,
         series_step => pCur.step,
-        series_stop => pCur.stop,
+        series_stop => pCur.max_value,
         else => pCur.value,
     };
     sqlite3_api.*.result_int64.?(cxt, x);
@@ -318,7 +340,11 @@ pub fn generateSeriesRowid(pCursor: [*c]c.sqlite3_vtab_cursor, pRowid: [*c]c.sql
 pub fn generateSeriesNext(pCursor: [*c]c.sqlite3_vtab_cursor) callconv(.C) c_int {
     var pCur = @fieldParentPtr(Cursor, "base", pCursor);
     pCur.*.rowid += 1;
-    pCur.*.value += pCur.*.step;
+    if (pCur.*.is_desc) {
+        pCur.*.value -= pCur.*.step;
+    } else {
+        pCur.*.value += pCur.*.step;
+    }
     return c.SQLITE_OK;
 }
 
@@ -328,10 +354,11 @@ pub fn generateSeriesNext(pCursor: [*c]c.sqlite3_vtab_cursor) callconv(.C) c_int
 //
 pub fn generateSeriesEof(pCursor: [*c]c.sqlite3_vtab_cursor) callconv(.C) c_int {
     var pCur = @fieldParentPtr(Cursor, "base", pCursor);
-    if (pCur.value > pCur.stop) {
-        return @boolToInt(true); 
+    if (pCur.is_desc) {
+        return @boolToInt(pCur.value < pCur.min_value);
+    } else {
+        return @boolToInt(pCur.value > pCur.max_value);
     }
-    return @boolToInt(false);
 }
 
 // "eponymous virtual tables": exist automatically in the "main" schema of every database connection in which their module is registered
